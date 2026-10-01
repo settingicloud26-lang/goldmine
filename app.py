@@ -1,6 +1,6 @@
-from datetime import datetime, timezone
 import io
 import json
+from datetime import datetime, timezone
 import pandas as pd
 import plotly.graph_objects as go
 import requests
@@ -13,20 +13,43 @@ st.set_page_config(
 )
 
 st.title("🪙 XAUUSD Institutional Terminal")
-st.caption(
-    "Automated fundamental tracking & directional bias engine for prop execution"
-)
+st.caption("Automated fundamental tracking & directional bias engine for prop execution")
 
 # =====================================================================
-# TIER 1: SLOW / MACRO ANCHORS (Cached for 12 Hours to Prevent Rate Blocks)
+# DATA ARMOR: Bypass Streamlit Cloud / Yahoo Finance Blockers
 # =====================================================================
+def get_yf_data(ticker, period="5d", interval="1d"):
+    """
+    Forces robust data extraction. Streamlit Cloud often blocks Ticker().history() 
+    for Forex pairs. This tries bulk downloads first, handles MultiIndex pandas 
+    structures, and uses safe fallbacks.
+    """
+    try:
+        # Method 1: yf.download (Bypasses Cloud Forex blocks)
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                return df["Close"][ticker].dropna()
+            return df["Close"].dropna()
+    except Exception:
+        pass
+    
+    try:
+        # Method 2: Standard Ticker History Fallback
+        tk = yf.Ticker(ticker)
+        df = tk.history(period=period, interval=interval)
+        if not df.empty and "Close" in df.columns:
+            return df["Close"].dropna()
+    except Exception:
+        pass
+        
+    return pd.Series(dtype=float)
 
+# =====================================================================
+# TIER 1: SLOW / MACRO ANCHORS (Cached for 12 Hours)
+# =====================================================================
 @st.cache_data(ttl=43200)
 def fetch_macro_anchors():
-    """Fetches COT positioning, CPI, US Debt, and 10Y Seasonality."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-
-    # 1. COT Positioning via CFTC Socrata API
     net_spec_val = None
     try:
         url = "https://publicreporting.cftc.gov/resource/jun7-fc8e.json?$limit=200&$order=report_date_as_yyyy_mm_dd%20DESC"
@@ -38,119 +61,96 @@ def fetch_macro_anchors():
                 nc_short = int(row.get("noncomm_positions_short_all", 0))
                 net_spec_val = nc_long - nc_short
                 break
-    except Exception:
-        pass
+    except Exception: pass
 
-    # 2. CPI Inflation via BLS API
     cpi_num = None
     try:
         curr_y = datetime.now().year
-        payload = json.dumps({
-            "seriesid": ["CUSR0000SA0"],
-            "startyear": str(curr_y - 2),
-            "endyear": str(curr_y),
-        })
-        p = requests.post(
-            "https://api.bls.gov/publicAPI/v2/timeseries/data/",
-            data=payload,
-            headers={"Content-type": "application/json"},
-            timeout=8,
-        )
+        payload = json.dumps({"seriesid": ["CUSR0000SA0"], "startyear": str(curr_y - 2), "endyear": str(curr_y)})
+        p = requests.post("https://api.bls.gov/publicAPI/v2/timeseries/data/", data=payload, headers={"Content-type": "application/json"}, timeout=8)
         cpi_pts = p.json()["Results"]["series"][0]["data"]
-        cpi_num = round(
-            ((float(cpi_pts[0]["value"]) - float(cpi_pts[12]["value"]))
-            / float(cpi_pts[12]["value"])) * 100, 1,
-        )
-    except Exception:
-        pass
+        cpi_num = round(((float(cpi_pts[0]["value"]) - float(cpi_pts[12]["value"])) / float(cpi_pts[12]["value"])) * 100, 1)
+    except Exception: pass
 
-    # 3. US National Debt via Treasury API
     debt_val = None
     try:
         d_url = "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/debt_to_penny?sort=-record_date&page[size]=1"
         d_res = requests.get(d_url, timeout=8).json()
-        debt_val = round(
-            float(d_res["data"][0]["tot_pub_debt_out_amt"]) / 1e12, 2
-        )
-    except Exception:
-        pass
+        debt_val = round(float(d_res["data"][0]["tot_pub_debt_out_amt"]) / 1e12, 2)
+    except Exception: pass
 
-    # 4. 10-Year Monthly Seasonality (Using Spot Gold)
+    # Seasonality: Fallback to GC=F if Yahoo lacks 10-year spot forex history
     seasonality = pd.Series(dtype=float)
     try:
-        gold_10y = yf.Ticker("XAUUSD=X").history(period="10y", interval="1mo")["Close"].dropna()
-        monthly_returns = gold_10y.pct_change() * 100
-        seasonality = monthly_returns.groupby(monthly_returns.index.strftime("%b")).mean()
-        months_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        seasonality = seasonality.reindex(months_order).dropna()
-    except Exception:
-        pass
+        gold_10y = get_yf_data("XAUUSD=X", period="10y", interval="1mo")
+        if gold_10y.empty or len(gold_10y) < 24: 
+            gold_10y = get_yf_data("GC=F", period="10y", interval="1mo")
+            
+        if not gold_10y.empty:
+            monthly_returns = gold_10y.pct_change() * 100
+            seasonality = monthly_returns.groupby(monthly_returns.index.strftime("%b")).mean()
+            months_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+            seasonality = seasonality.reindex(months_order).dropna()
+    except Exception: pass
 
     return net_spec_val, cpi_num, debt_val, seasonality
 
 # =====================================================================
 # TIER 2: MEDIUM DATA (Cached for 15 Minutes)
 # =====================================================================
-
 @st.cache_data(ttl=900)
 def fetch_intermediate_data():
-    """Fetches 6-month historical chart data and nearest OPEX strike."""
-    try:
-        history_df = yf.Ticker("XAUUSD=X").history(period="6mo", interval="1d")["Close"].dropna()
-    except Exception:
-        history_df = pd.Series(dtype=float)
-
+    history_df = get_yf_data("XAUUSD=X", period="6mo", interval="1d")
+    
     max_call_strike = "N/A"
     try:
+        # Yahoo Options API frequently goes offline; catch gracefully
         gld_opts = yf.Ticker("GLD")
         nearest_exp = gld_opts.options[0]
         calls = gld_opts.option_chain(nearest_exp).calls
         max_call_strike = calls.loc[calls["openInterest"].idxmax()]["strike"]
-    except Exception:
-        pass
+    except Exception: pass
 
     return history_df, max_call_strike
 
 # =====================================================================
-# TIER 3: FAST DATA & EXECUTION (Refreshes Every 60s without Rate Blocks)
+# TIER 3: FAST DATA & EXECUTION (Refreshes Every 60s)
 # =====================================================================
-
 @st.fragment(run_every=60)
 def render_live_dashboard():
     with st.spinner("Fetching active session data..."):
-        # 1. Fetch Fast Quotes Individually (Bulletproof method)
-        try:
-            latest_gold = round(float(yf.Ticker("XAUUSD=X").history(period="5d")["Close"].dropna().iloc[-1]), 2)
-        except Exception: latest_gold = None
+        
+        gold_px = get_yf_data("XAUUSD=X", period="5d")
+        latest_gold = round(float(gold_px.iloc[-1]), 2) if not gold_px.empty else None
 
-        try:
-            latest_silver = round(float(yf.Ticker("XAGUSD=X").history(period="5d")["Close"].dropna().iloc[-1]), 2)
-        except Exception: latest_silver = None
+        silv_px = get_yf_data("XAGUSD=X", period="5d")
+        latest_silver = round(float(silv_px.iloc[-1]), 2) if not silv_px.empty else None
 
-        try:
-            latest_dxy = round(float(yf.Ticker("DX-Y.NYB").history(period="5d")["Close"].dropna().iloc[-1]), 2)
-        except Exception: latest_dxy = None
+        dxy_px = get_yf_data("DX-Y.NYB", period="5d")
+        latest_dxy = round(float(dxy_px.iloc[-1]), 2) if not dxy_px.empty else None
 
-        try:
-            latest_yield = round(float(yf.Ticker("^TNX").history(period="5d")["Close"].dropna().iloc[-1]), 2)
-        except Exception: latest_yield = None
+        yield_px = get_yf_data("^TNX", period="5d")
+        latest_yield = round(float(yield_px.iloc[-1]), 2) if not yield_px.empty else None
 
-        try:
-            gsr = round(latest_gold / latest_silver, 2) if latest_gold and latest_silver else None
-        except Exception: gsr = None
+        gsr = round(latest_gold / latest_silver, 2) if (latest_gold and latest_silver) else None
 
         try:
             vol_df = yf.Ticker("GLD").history(period="1mo")["Volume"].dropna()
             gld_rel_vol = round(float(vol_df.iloc[-1] / vol_df.mean()), 2)
-        except Exception: gld_rel_vol = None
+        except Exception: 
+            gld_rel_vol = None
 
-        try:
-            corr_df = yf.download(["XAUUSD=X", "DX-Y.NYB"], period="2mo", interval="1d", progress=False)["Close"]
-            rets = corr_df.pct_change().dropna()
-            latest_corr = round(float(rets["XAUUSD=X"].rolling(30).corr(rets["DX-Y.NYB"]).dropna().iloc[-1]), 3)
-        except Exception: latest_corr = None
+        # Custom isolated Correlation fetch to avoid multi-ticker DataFrame crashes
+        latest_corr = None
+        gold_2m = get_yf_data("XAUUSD=X", period="2mo")
+        dxy_2m = get_yf_data("DX-Y.NYB", period="2mo")
+        if not gold_2m.empty and not dxy_2m.empty:
+            try:
+                df_corr = pd.DataFrame({"Gold": gold_2m, "DXY": dxy_2m}).dropna()
+                rets = df_corr.pct_change().dropna()
+                latest_corr = round(float(rets["Gold"].rolling(30).corr(rets["DXY"]).dropna().iloc[-1]), 3)
+            except Exception: pass
 
-        # Load Cached Tiers
         net_spec_val, cpi_num, debt_val, seasonality = fetch_macro_anchors()
         history_df, max_call_strike = fetch_intermediate_data()
 
@@ -321,7 +321,7 @@ def render_live_dashboard():
                 fig_price.add_trace(
                     go.Scatter(
                         x=history_df.index,
-                        y=history_df, # Values bug fixed here
+                        y=history_df,
                         name="Spot Gold",
                         line=dict(color="#FFD700", width=2),
                     )
@@ -329,7 +329,7 @@ def render_live_dashboard():
                 fig_price.update_layout(template="plotly_dark", height=380, margin=dict(l=0, r=0, t=30, b=0))
                 st.plotly_chart(fig_price, use_container_width=True)
             else:
-                st.info("Chart data updating...")
+                st.info("Chart data updating... (Waiting for Yahoo Finance)")
 
         with season_col:
             st.subheader("10-Year Historical Seasonality (% Avg Return)")
@@ -339,7 +339,7 @@ def render_live_dashboard():
                 fig_season.update_layout(template="plotly_dark", height=380, margin=dict(l=0, r=0, t=30, b=0), yaxis_title="% Return")
                 st.plotly_chart(fig_season, use_container_width=True)
             else:
-                st.info("Seasonality data loading...")
+                st.info("Seasonality data loading... (Waiting for Yahoo Finance)")
 
     with tab_playbook:
         st.subheader("📋 Prop Firm Execution Protocol (XAUUSD)")
