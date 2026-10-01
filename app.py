@@ -113,14 +113,11 @@ def fetch_macro_anchors():
 # TIER 2: MEDIUM DATA (Cached for 15 Minutes)
 # =====================================================================
 
-
 @st.cache_data(ttl=900)
 def fetch_intermediate_data():
     """Fetches 6-month historical chart data and nearest OPEX strike."""
     try:
-        history_df = yf.download(
-            "GC=F", period="6mo", interval="1d", progress=False
-        )["Close"].dropna()
+        history_df = yf.Ticker("GC=F").history(period="6mo", interval="1d")["Close"].dropna()
     except Exception:
         history_df = pd.Series(dtype=float)
 
@@ -396,7 +393,7 @@ def render_live_dashboard():
                 fig_price.add_trace(
                     go.Scatter(
                         x=history_df.index,
-                        y=history_df.values,
+                        y=history_df,
                         name="Gold",
                         line=dict(color="#FFD700", width=2),
                     )
