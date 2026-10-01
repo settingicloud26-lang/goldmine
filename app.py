@@ -81,7 +81,7 @@ def fetch_macro_anchors():
     # 4. 10-Year Monthly Seasonality
     seasonality = pd.Series(dtype=float)
     try:
-        gold_10y = yf.Ticker("GC=F").history(period="10y", interval="1mo")[
+        gold_10y = yf.Ticker("XAUUSD=X").history(period="10y", interval="1mo")[
             "Close"
         ].dropna()
         monthly_returns = gold_10y.pct_change() * 100
@@ -117,7 +117,7 @@ def fetch_macro_anchors():
 def fetch_intermediate_data():
     """Fetches 6-month historical chart data and nearest OPEX strike."""
     try:
-        history_df = yf.Ticker("GC=F").history(period="6mo", interval="1d")["Close"].dropna()
+        history_df = yf.Ticker("XAUUSD=X").history(period="6mo", interval="1d")["Close"].dropna()
     except Exception:
         history_df = pd.Series(dtype=float)
 
@@ -144,15 +144,15 @@ def render_live_dashboard():
     with st.spinner("Fetching active session data..."):
         try:
             fast_data = yf.download(
-                ["GC=F", "SI=F", "DX-Y.NYB", "^TNX", "GLD"],
+                ["XAUUSD=X", "XAGUSD=X", "DX-Y.NYB", "^TNX", "GLD"],
                 period="5d",
                 interval="1d",
                 progress=False,
             )
             closes = fast_data["Close"]
 
-            latest_gold = round(float(closes["GC=F"].dropna().iloc[-1]), 2)
-            latest_silver = round(float(closes["SI=F"].dropna().iloc[-1]), 2)
+            latest_gold = round(float(closes["XAUUSD=X"].dropna().iloc[-1]), 2)
+            latest_silver = round(float(closes["XAGUSD=X"].dropna().iloc[-1]), 2)
             latest_dxy = round(float(closes["DX-Y.NYB"].dropna().iloc[-1]), 2)
             latest_yield = round(float(closes["^TNX"].dropna().iloc[-1]), 2)
 
@@ -170,12 +170,12 @@ def render_live_dashboard():
         # 30-Day DXY Correlation (Calculated using 2-month history)
         try:
             corr_df = yf.download(
-                ["GC=F", "DX-Y.NYB"], period="2mo", interval="1d", progress=False
+                ["XAUUSD=X", "DX-Y.NYB"], period="2mo", interval="1d", progress=False
             )["Close"]
             rets = corr_df.pct_change().dropna()
             latest_corr = round(
                 float(
-                    rets["GC=F"]
+                    rets["XAUUSD=X"]
                     .rolling(30)
                     .corr(rets["DX-Y.NYB"])
                     .dropna()
@@ -319,7 +319,7 @@ def render_live_dashboard():
         c1.metric(
             "Spot Gold",
             f"${latest_gold:,.2f}",
-            delta="Live GC=F",
+            delta="Live XAUUSD=X",
             delta_color="off",
             help="Active spot futures benchmark.",
         )
